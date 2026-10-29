@@ -1,5 +1,8 @@
 //! Global equirectangular grids.
 
+/// Four cells and their weights.
+pub type Stencil = [(usize, f32); 4];
+
 /// A grid of values over the whole globe. Row 0 is at the north, and column 0
 /// is at the west edge, at -180°. Each value is the mean over its cell.
 #[derive(Clone, Debug, PartialEq)]
@@ -49,36 +52,57 @@ impl Grid {
     /// on the cells where `keep` is true. `None`: none of the four cells is
     /// kept.
     pub fn sample_where(&self, lon: f64, lat: f64, keep: impl Fn(usize) -> bool) -> Option<f32> {
+        self.stencil_where(lon, lat, keep).map(|s| self.apply(&s))
+    }
+
+    /// The cells and the weights of [`Grid::sample_where`]. The weights add
+    /// up to 1. A grid of the same size takes the same stencil.
+    pub fn stencil_where(
+        &self,
+        lon: f64,
+        lat: f64,
+        keep: impl Fn(usize) -> bool,
+    ) -> Option<Stencil> {
         let (x, y) = self.position(lon, lat);
         let (c0, c1, fx) = self.columns(x);
         let (r0, r1, fy) = self.rows(y);
-        let fx = fx as f64;
-        let fy = fy as f64;
-        let cells = [
-            (c0, r0, (1.0 - fx) * (1.0 - fy)),
-            (c1, r0, fx * (1.0 - fy)),
-            (c0, r1, (1.0 - fx) * fy),
-            (c1, r1, fx * fy),
+        let mut cells = [
+            (r0 * self.width + c0, (1.0 - fx) * (1.0 - fy)),
+            (r0 * self.width + c1, fx * (1.0 - fy)),
+            (r1 * self.width + c0, (1.0 - fx) * fy),
+            (r1 * self.width + c1, fx * fy),
         ];
-        let mut sum = 0.0;
         let mut weight = 0.0;
-        for (c, r, w) in cells {
-            let i = r * self.width + c;
-            if keep(i) {
-                sum += self.values[i] as f64 * w;
-                weight += w;
+        for (i, w) in &mut cells {
+            if keep(*i) {
+                weight += *w;
+            } else {
+                *w = 0.0;
             }
         }
-        // A kept cell with a weight of zero still counts, so the place has a value.
         if weight > 0.0 {
-            Some((sum / weight) as f32)
-        } else {
-            cells
-                .iter()
-                .map(|&(c, r, _)| r * self.width + c)
-                .find(|&i| keep(i))
-                .map(|i| self.values[i])
+            for (_, w) in &mut cells {
+                *w /= weight;
+            }
+            return Some(cells);
         }
+        // A kept cell with a weight of zero still gives the place a value.
+        let i = cells.iter().map(|&(i, _)| i).find(|&i| keep(i))?;
+        Some([(i, 1.0), (i, 0.0), (i, 0.0), (i, 0.0)])
+    }
+
+    /// The blend of the cells of a stencil.
+    pub fn apply(&self, stencil: &Stencil) -> f32 {
+        stencil.iter().map(|&(i, w)| self.values[i] * w).sum()
+    }
+
+    /// The cell that holds a place.
+    pub fn cell(&self, lon: f64, lat: f64) -> usize {
+        let col = ((lon + 180.0) / 360.0 * self.width as f64).floor() as i64;
+        let row = ((90.0 - lat) / 180.0 * self.height as f64).floor() as i64;
+        let col = col.rem_euclid(self.width as i64) as usize;
+        let row = row.clamp(0, self.height as i64 - 1) as usize;
+        row * self.width + col
     }
 
     /// The place in cell units, where the center of cell (0, 0) is at (0, 0).
