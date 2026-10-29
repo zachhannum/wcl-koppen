@@ -1,6 +1,7 @@
 //! Köppen-Geiger climate zones from a World Climate Lab export.
 
 pub mod downscale;
+pub mod filter;
 pub mod grid;
 pub mod height;
 pub mod koppen;
