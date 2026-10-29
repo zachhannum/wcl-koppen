@@ -80,6 +80,33 @@ pub fn classify(climate: &Climate, heights: &Heightmap, params: Downscale) -> Cl
     }
 }
 
+/// The slope of the elevation of the export against the mean height of
+/// the heightmap over each land cell of the export. A slope of 1 means that
+/// the two have the same scale.
+pub fn elevation_slope(climate: &Climate, heights: &Heightmap) -> f64 {
+    let grid = &climate.elevation;
+    let k = heights.width / grid.width;
+    if k == 0 || heights.height / grid.height != k {
+        return f64::NAN;
+    }
+    let (mut sx, mut sy, mut sxx, mut sxy, mut n) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for row in 0..grid.height {
+        for col in 0..grid.width {
+            let i = row * grid.width + col;
+            let x = heights.block_mean(col * k, row * k, k) as f64;
+            if climate.land.values[i] > 0.0 && x > 0.0 {
+                let y = grid.values[i] as f64;
+                sx += x;
+                sy += y;
+                sxx += x * x;
+                sxy += x * y;
+                n += 1.0;
+            }
+        }
+    }
+    (n * sxy - sx * sy) / (n * sxx - sx * sx)
+}
+
 /// The nearest land cell of each cell, in steps across the grid. The steps
 /// wrap at 180°. A grid with no land gives each cell itself.
 fn nearest_land(land: &Grid) -> Vec<usize> {

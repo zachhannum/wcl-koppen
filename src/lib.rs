@@ -2,6 +2,7 @@
 
 pub mod downscale;
 pub mod filter;
+pub mod geojson;
 pub mod grid;
 pub mod height;
 pub mod koppen;

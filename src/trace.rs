@@ -136,7 +136,12 @@ fn trace_rings(t: &Tracer) -> Vec<Ring> {
             }
             let yb = h - 1 - r;
             // The four sides of the cell, as the edges with the cell at the left.
-            let starts = [(c, yb, 0), (c + 1, yb, 1), (c + 1, yb + 1, 2), (c, yb + 1, 3)];
+            let starts = [
+                (c, yb, 0),
+                (c + 1, yb, 1),
+                (c + 1, yb + 1, 2),
+                (c, yb + 1, 3),
+            ];
             for (x, y, d) in starts {
                 if seen[(r * w + c) as usize] & (1 << d) != 0 || !t.is_boundary(x, y, d, class) {
                     continue;
@@ -554,7 +559,8 @@ fn assemble(rings: Vec<Ring>, shaped: Vec<Vec<[f64; 2]>>, height: u32) -> Vec<Po
         area: f64,
     }
     let mut outers: Vec<Outer> = Vec::new();
-    let mut holes: Vec<(Class, (u32, u32), Vec<[f64; 2]>)> = Vec::new();
+    type Hole = (Class, (u32, u32), Vec<[f64; 2]>);
+    let mut holes: Vec<Hole> = Vec::new();
     for (ring, points) in rings.into_iter().zip(shaped) {
         let area = signed_area(&points);
         if area > 0.0 {
@@ -588,7 +594,11 @@ fn assemble(rings: Vec<Ring>, shaped: Vec<Vec<[f64; 2]>>, height: u32) -> Vec<Po
                 return false;
             }
             let (x0, y0, x1, y1) = o.bbox;
-            x >= x0 as f64 && x <= x1 as f64 && y >= y0 as f64 && y <= y1 as f64 && contains(&o.turns, x, y)
+            x >= x0 as f64
+                && x <= x1 as f64
+                && y >= y0 as f64
+                && y <= y1 as f64
+                && contains(&o.turns, x, y)
         });
         if let Some(k) = owner {
             outers[k].polygon.holes.push(points);
@@ -648,7 +658,10 @@ mod tests {
         assert!(p[0].holes.is_empty());
         let ring = &p[0].exterior;
         assert_eq!(ring.first(), ring.last());
-        assert!(signed_area(ring) > 0.0, "the exterior turns counterclockwise");
+        assert!(
+            signed_area(ring) > 0.0,
+            "the exterior turns counterclockwise"
+        );
         assert_eq!(
             sorted(ring),
             sorted(&[[-90.0, 45.0], [0.0, 45.0], [0.0, -45.0], [-90.0, -45.0]])
