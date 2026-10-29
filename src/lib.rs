@@ -5,6 +5,7 @@ pub mod filter;
 pub mod grid;
 pub mod height;
 pub mod koppen;
+pub mod trace;
 pub mod wcl;
 
 use grid::Grid;
