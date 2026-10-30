@@ -30,9 +30,16 @@ cargo run --release -- check path/to/climate-data
 4. The tool classifies each land cell.
 5. A zone below the minimum area joins the zones around it. A zone is a set of cells of one class that join at their sides.
 6. The tool traces the boundaries of the zones. It smooths each boundary between two zones one time, so the two zones share the same points.
-7. The tool simplifies the boundaries and writes one GeoJSON feature for each polygon.
+7. The tool simplifies the boundaries. Where two simplified lines cross, it puts back points until no lines cross.
+8. The tool writes one GeoJSON feature for each polygon.
 
 A 32,768 × 16,384 heightmap takes about 20 seconds and 2 GB of memory. The option `--step` makes one cell of the zones from a block of cells of the heightmap.
+
+A full-detail file can have more points than a view can draw at speed. For a world map, a larger tolerance and a larger minimum area make a smaller file:
+
+```sh
+cargo run --release -- zones path/to/climate-data --heightmap world.tif --step 2 --tolerance-km 5 --min-area-km2 2000 --smooth-km 6 --out zones-world.geojson
+```
 
 ## Output
 

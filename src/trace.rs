@@ -115,11 +115,13 @@ pub fn polygons(grid: &ClassGrid, shape: Shape) -> Vec<Polygon> {
         h: grid.height as i64,
     };
     let rings = trace_rings(&tracer);
-    let mut arcs = ArcCache::default();
-    let shaped: Vec<Vec<[f64; 2]>> = rings
+    let mut arcs = Arcs::default();
+    let parts: Vec<Vec<Part>> = rings
         .iter()
-        .map(|ring| shape_ring(&tracer, ring, shape, &mut arcs))
+        .map(|ring| ring_parts(&tracer, ring, shape, &mut arcs))
         .collect();
+    repair(&mut arcs.list, shape);
+    let shaped = parts.iter().map(|p| ring_points(&arcs.list, p)).collect();
     assemble(rings, shaped, grid.height as u32)
 }
 
@@ -182,13 +184,34 @@ fn trace_ring(t: &Tracer, seen: &mut [u8], x0: i64, y0: i64, d0: usize, class: u
     }
 }
 
-/// The shaped arcs between two zones, until the second zone takes them.
-#[derive(Default)]
-struct ArcCache {
-    arcs: HashMap<(Corner, Corner, Corner), Vec<[f64; 2]>>,
+/// A boundary between two labels, smoothed one time. The kept points make
+/// the simplified line, and the ends of an open arc are always kept.
+struct Arc {
+    points: Vec<[f64; 2]>,
+    keep: Vec<bool>,
+    /// The last point of a closed arc joins its first point.
+    closed: bool,
+    /// An arc along the 180° meridian or a pole is straight and never moves.
+    fixed: bool,
 }
 
-fn shape_ring(t: &Tracer, ring: &Ring, shape: Shape, cache: &mut ArcCache) -> Vec<[f64; 2]> {
+impl Arc {
+    fn kept(&self) -> Vec<usize> {
+        (0..self.points.len()).filter(|&i| self.keep[i]).collect()
+    }
+}
+
+/// An arc of a ring, and true if the ring goes along it backward.
+type Part = (usize, bool);
+
+/// The arcs, with the arcs between two zones by their canonical corners.
+#[derive(Default)]
+struct Arcs {
+    list: Vec<Arc>,
+    shared: HashMap<(Corner, Corner, Corner), usize>,
+}
+
+fn ring_parts(t: &Tracer, ring: &Ring, shape: Shape, arcs: &mut Arcs) -> Vec<Part> {
     let n = ring.corners.len();
     let nodes: Vec<usize> = (0..n)
         .filter(|&i| {
@@ -196,73 +219,65 @@ fn shape_ring(t: &Tracer, ring: &Ring, shape: Shape, cache: &mut ArcCache) -> Ve
             t.is_node(x as i64, y as i64)
         })
         .collect();
-    let mut out: Vec<[f64; 2]> = Vec::new();
     if nodes.is_empty() {
-        let points = shape_loop(t, &ring.corners, ring.others[0], shape, cache);
-        out.extend(points);
-        out.push(out[0]);
-        return out;
+        return vec![loop_part(t, &ring.corners, ring.others[0], shape, arcs)];
     }
+    let mut parts = Vec::with_capacity(nodes.len());
     for (k, &start) in nodes.iter().enumerate() {
         let end = nodes[(k + 1) % nodes.len()];
         let len = (end + n - start) % n;
         let len = if len == 0 { n } else { len };
         let corners: Vec<Corner> = (0..=len).map(|j| ring.corners[(start + j) % n]).collect();
-        let points = shape_arc(t, &corners, ring.others[start], shape, cache);
-        let skip = usize::from(!out.is_empty());
-        out.extend(points.into_iter().skip(skip));
+        parts.push(arc_part(t, &corners, ring.others[start], shape, arcs));
     }
-    out
+    parts
 }
 
-/// The points of an arc between two nodes, from its first corner to its last.
-fn shape_arc(
-    t: &Tracer,
-    corners: &[Corner],
-    other: u16,
-    shape: Shape,
-    cache: &mut ArcCache,
-) -> Vec<[f64; 2]> {
+/// The arc between two nodes, from its first corner to its last.
+fn arc_part(t: &Tracer, corners: &[Corner], other: u16, shape: Shape, arcs: &mut Arcs) -> Part {
     let n = corners.len();
     if other == OUTSIDE {
-        // An arc along the 180° meridian or a pole is straight.
-        return vec![lonlat(t, corners[0]), lonlat(t, corners[n - 1])];
+        arcs.list.push(Arc {
+            points: vec![lonlat(t, corners[0]), lonlat(t, corners[n - 1])],
+            keep: vec![true, true],
+            closed: false,
+            fixed: true,
+        });
+        return (arcs.list.len() - 1, false);
     }
+    let open = |corners: &[Corner]| {
+        let points = smooth_open(t, corners, shape);
+        let keep = simplify(&points, shape);
+        Arc {
+            points,
+            keep,
+            closed: false,
+            fixed: false,
+        }
+    };
     if other == NO_CLASS as u16 {
-        return shape_open(t, corners, shape);
+        arcs.list.push(open(corners));
+        return (arcs.list.len() - 1, false);
     }
     let forward = (corners[0], corners[1], corners[n - 1]);
     let backward = (corners[n - 1], corners[n - 2], corners[0]);
     let reversed = backward < forward;
     let key = if reversed { backward } else { forward };
-    let points = match cache.arcs.remove(&key) {
-        Some(points) => points,
-        None => {
-            let mut canonical = corners.to_vec();
-            if reversed {
-                canonical.reverse();
-            }
-            let points = shape_open(t, &canonical, shape);
-            cache.arcs.insert(key, points.clone());
-            points
-        }
-    };
-    if reversed {
-        points.into_iter().rev().collect()
-    } else {
-        points
+    if let Some(&id) = arcs.shared.get(&key) {
+        return (id, reversed);
     }
+    let mut canonical = corners.to_vec();
+    if reversed {
+        canonical.reverse();
+    }
+    arcs.list.push(open(&canonical));
+    let id = arcs.list.len() - 1;
+    arcs.shared.insert(key, id);
+    (id, reversed)
 }
 
-/// The points of a closed boundary with no node, in the order of `corners`,
-/// without the closing point.
-fn shape_loop(
-    t: &Tracer,
-    corners: &[Corner],
-    other: u16,
-    shape: Shape,
-    cache: &mut ArcCache,
-) -> Vec<[f64; 2]> {
+/// The arc of a closed boundary with no node.
+fn loop_part(t: &Tracer, corners: &[Corner], other: u16, shape: Shape, arcs: &mut Arcs) -> Part {
     let n = corners.len();
     // The canonical loop starts at the least corner and goes to the lesser
     // of its two neighbors, so both zones of the loop get the same points.
@@ -277,22 +292,126 @@ fn shape_loop(
     };
     let key = (canonical[0], canonical[1], canonical[0]);
     let shared = other != NO_CLASS as u16;
-    let points = match shared.then(|| cache.arcs.remove(&key)).flatten() {
-        Some(points) => points,
-        None => {
-            let points = shape_closed(t, &canonical, shape);
-            if shared {
-                cache.arcs.insert(key, points.clone());
-            }
-            points
-        }
-    };
-    // The ring may start at any point, so only the direction matters.
-    if reversed {
-        points.into_iter().rev().collect()
-    } else {
-        points
+    if shared && let Some(&id) = arcs.shared.get(&key) {
+        return (id, reversed);
     }
+    let points = smooth_closed(t, &canonical, shape);
+    let keep = simplify_closed(&points, shape);
+    arcs.list.push(Arc {
+        points,
+        keep,
+        closed: true,
+        fixed: false,
+    });
+    let id = arcs.list.len() - 1;
+    if shared {
+        arcs.shared.insert(key, id);
+    }
+    (id, reversed)
+}
+
+/// The closed ring of the kept points of the parts.
+fn ring_points(arcs: &[Arc], parts: &[Part]) -> Vec<[f64; 2]> {
+    let mut out: Vec<[f64; 2]> = Vec::new();
+    for &(id, reversed) in parts {
+        let arc = &arcs[id];
+        let mut points: Vec<[f64; 2]> = arc.kept().into_iter().map(|i| arc.points[i]).collect();
+        if reversed {
+            points.reverse();
+        }
+        if arc.closed {
+            out.extend(points);
+            out.push(out[0]);
+            return out;
+        }
+        let skip = usize::from(!out.is_empty());
+        out.extend(points.into_iter().skip(skip));
+    }
+    out
+}
+
+/// Puts back points of the simplified arcs until no two segments cross.
+/// Each round adds the farthest left-out point of each segment of a
+/// crossing. A crossing of two segments that left out no point stays.
+fn repair(arcs: &mut [Arc], shape: Shape) {
+    // The bins are a few times the tolerance, and at least 0.05°.
+    let size =
+        (4.0 * shape.tolerance_km * 180.0 / (std::f64::consts::PI * shape.radius_km)).max(0.05);
+    for _ in 0..64 {
+        // Each segment: the arc, and the indices of its two points.
+        let mut segments: Vec<(usize, usize, usize)> = Vec::new();
+        for (id, arc) in arcs.iter().enumerate() {
+            if arc.fixed {
+                continue;
+            }
+            let kept = arc.kept();
+            for w in kept.windows(2) {
+                segments.push((id, w[0], w[1]));
+            }
+            if arc.closed && kept.len() > 1 {
+                segments.push((id, kept[kept.len() - 1], kept[0] + arc.points.len()));
+            }
+        }
+        let point = |&(id, i, _): &(usize, usize, usize)| arcs[id].points[i];
+        let end = |&(id, _, j): &(usize, usize, usize)| {
+            let arc = &arcs[id];
+            arc.points[j % arc.points.len()]
+        };
+        let mut bins: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+        for (k, seg) in segments.iter().enumerate() {
+            let (a, b) = (point(seg), end(seg));
+            let x0 = (a[0].min(b[0]) / size).floor() as i64;
+            let x1 = (a[0].max(b[0]) / size).floor() as i64;
+            let y0 = (a[1].min(b[1]) / size).floor() as i64;
+            let y1 = (a[1].max(b[1]) / size).floor() as i64;
+            for x in x0..=x1 {
+                for y in y0..=y1 {
+                    bins.entry((x, y)).or_default().push(k);
+                }
+            }
+        }
+        let mut refine = std::collections::BTreeSet::new();
+        for list in bins.values() {
+            for (n, &i) in list.iter().enumerate() {
+                for &j in &list[n + 1..] {
+                    let (si, sj) = (&segments[i], &segments[j]);
+                    if crosses(point(si), end(si), point(sj), end(sj)) {
+                        refine.insert(i);
+                        refine.insert(j);
+                    }
+                }
+            }
+        }
+        let mut added = false;
+        for k in refine {
+            let (id, i, j) = segments[k];
+            let arc = &mut arcs[id];
+            let n = arc.points.len();
+            if j <= i + 1 {
+                continue;
+            }
+            let (a, b) = (arc.points[i], arc.points[j % n]);
+            let far = (i + 1..j)
+                .max_by(|&p, &q| {
+                    let d = |m: usize| line_distance2(a, b, arc.points[m % n], shape);
+                    d(p).total_cmp(&d(q))
+                })
+                .unwrap();
+            arc.keep[far % n] = true;
+            added = true;
+        }
+        if !added {
+            break;
+        }
+    }
+}
+
+/// True if two segments cross at a point inside both.
+fn crosses(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+    let side = |o: [f64; 2], p: [f64; 2], q: [f64; 2]| {
+        (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+    };
+    side(c, d, a) * side(c, d, b) < 0.0 && side(a, b, c) * side(a, b, d) < 0.0
 }
 
 fn lonlat(t: &Tracer, (x, y): Corner) -> [f64; 2] {
@@ -325,8 +444,8 @@ fn distance_km(a: [f64; 3], b: [f64; 3], radius_km: f64) -> f64 {
     (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() * radius_km
 }
 
-/// Smooths and simplifies an open arc. The ends stay where they are.
-fn shape_open(t: &Tracer, corners: &[Corner], shape: Shape) -> Vec<[f64; 2]> {
+/// Smooths an open arc. The ends stay where they are.
+fn smooth_open(t: &Tracer, corners: &[Corner], shape: Shape) -> Vec<[f64; 2]> {
     let raw: Vec<[f64; 2]> = corners.iter().map(|&c| lonlat(t, c)).collect();
     let n = raw.len();
     let v: Vec<[f64; 3]> = raw.iter().map(|&p| to_vector(p)).collect();
@@ -379,7 +498,7 @@ fn shape_open(t: &Tracer, corners: &[Corner], shape: Shape) -> Vec<[f64; 2]> {
             smooth[i] = from_vector(sum, raw[i]);
         }
     }
-    simplify(&smooth, shape)
+    smooth
 }
 
 /// The reflection of `p` through `center`.
@@ -391,9 +510,8 @@ fn reflect(center: [f64; 3], p: [f64; 3]) -> [f64; 3] {
     ]
 }
 
-/// Smooths and simplifies a closed loop. Returns the points without the
-/// closing point.
-fn shape_closed(t: &Tracer, corners: &[Corner], shape: Shape) -> Vec<[f64; 2]> {
+/// Smooths a closed loop. Returns the points without the closing point.
+fn smooth_closed(t: &Tracer, corners: &[Corner], shape: Shape) -> Vec<[f64; 2]> {
     let raw: Vec<[f64; 2]> = corners.iter().map(|&c| lonlat(t, c)).collect();
     let n = raw.len();
     let v: Vec<[f64; 3]> = raw.iter().map(|&p| to_vector(p)).collect();
@@ -437,27 +555,32 @@ fn shape_closed(t: &Tracer, corners: &[Corner], shape: Shape) -> Vec<[f64; 2]> {
             smooth[i] = from_vector(sum, raw[i]);
         }
     }
-    // The loop splits at its first point and at the point farthest from it.
+    smooth
+}
+
+/// The points of a closed loop to keep. The loop splits at its first point
+/// and at the point farthest from it, and each half is simplified.
+fn simplify_closed(points: &[[f64; 2]], shape: Shape) -> Vec<bool> {
+    let n = points.len();
     let far = (0..n)
         .max_by(|&a, &b| {
-            let d = |i: usize| planar(smooth[0], smooth[i], shape.radius_km);
+            let d = |i: usize| planar(points[0], points[i], shape.radius_km);
             let (da, db) = (d(a), d(b));
             (da[0] * da[0] + da[1] * da[1]).total_cmp(&(db[0] * db[0] + db[1] * db[1]))
         })
         .unwrap();
-    let mut first: Vec<[f64; 2]> = smooth[..=far].to_vec();
-    let mut second: Vec<[f64; 2]> = smooth[far..].to_vec();
-    second.push(smooth[0]);
-    first = simplify(&first, shape);
-    second = simplify(&second, shape);
-    let mut out = first;
-    out.extend(second.into_iter().skip(1));
-    out.pop();
-    if out.len() < 4 && n >= 4 {
+    let mut keep = simplify(&points[..=far], shape);
+    let mut second: Vec<[f64; 2]> = points[far..].to_vec();
+    second.push(points[0]);
+    let rest = simplify(&second, shape);
+    keep.extend(&rest[1..rest.len() - 1]);
+    if keep.iter().filter(|&&k| k).count() < 4 && n >= 4 {
         // A tiny loop keeps a shape with an area.
-        return (0..4).map(|k| smooth[k * n / 4]).collect();
+        for k in 0..4 {
+            keep[k * n / 4] = true;
+        }
     }
-    out
+    keep
 }
 
 /// The offset of `p` from `origin` in km, on a plane at the latitude of
@@ -468,13 +591,24 @@ fn planar(origin: [f64; 2], p: [f64; 2], radius_km: f64) -> [f64; 2] {
     [(p[0] - origin[0]) * k * cos, (p[1] - origin[1]) * k]
 }
 
-/// The Douglas-Peucker simplification of an open line. The ends stay.
-fn simplify(points: &[[f64; 2]], shape: Shape) -> Vec<[f64; 2]> {
-    let n = points.len();
-    if n <= 2 {
-        return points.to_vec();
+/// The square of the distance in km of `p` from the line through `a` and `b`.
+fn line_distance2(a: [f64; 2], b: [f64; 2], p: [f64; 2], shape: Shape) -> f64 {
+    let end = planar(a, b, shape.radius_km);
+    let q = planar(a, p, shape.radius_km);
+    let len2 = end[0] * end[0] + end[1] * end[1];
+    if len2 == 0.0 {
+        q[0] * q[0] + q[1] * q[1]
+    } else {
+        let cross = q[0] * end[1] - q[1] * end[0];
+        cross * cross / len2
     }
-    let mut keep = vec![false; n];
+}
+
+/// The points of an open line that the Douglas-Peucker simplification
+/// keeps. The ends stay.
+fn simplify(points: &[[f64; 2]], shape: Shape) -> Vec<bool> {
+    let n = points.len();
+    let mut keep = vec![n <= 2; n];
     keep[0] = true;
     keep[n - 1] = true;
     let mut stack = vec![(0, n - 1)];
@@ -482,17 +616,9 @@ fn simplify(points: &[[f64; 2]], shape: Shape) -> Vec<[f64; 2]> {
         if b <= a + 1 {
             continue;
         }
-        let end = planar(points[a], points[b], shape.radius_km);
-        let len2 = end[0] * end[0] + end[1] * end[1];
         let (mut worst, mut at) = (0.0, a);
-        for (i, &p) in points.iter().enumerate().take(b).skip(a + 1) {
-            let q = planar(points[a], p, shape.radius_km);
-            let d2 = if len2 == 0.0 {
-                q[0] * q[0] + q[1] * q[1]
-            } else {
-                let cross = q[0] * end[1] - q[1] * end[0];
-                cross * cross / len2
-            };
+        for i in a + 1..b {
+            let d2 = line_distance2(points[a], points[b], points[i], shape);
             if d2 > worst {
                 worst = d2;
                 at = i;
@@ -504,11 +630,7 @@ fn simplify(points: &[[f64; 2]], shape: Shape) -> Vec<[f64; 2]> {
             stack.push((at, b));
         }
     }
-    points
-        .iter()
-        .zip(keep)
-        .filter_map(|(&p, k)| k.then_some(p))
-        .collect()
+    keep
 }
 
 /// The signed area of a ring in longitude and latitude units.
@@ -775,5 +897,34 @@ mod tests {
         assert!(ring.contains(&[-180.0, 90.0]) && ring.contains(&[180.0, 90.0]));
         // No point of the ring is south of the zone.
         assert!(ring.iter().all(|q| q[1] >= 45.0 - 1e-9));
+    }
+
+    #[test]
+    fn repair_removes_a_crossing() {
+        let shape = Shape {
+            smooth_km: 0.0,
+            tolerance_km: 100.0,
+            radius_km: 6371.0,
+        };
+        let bump = vec![[0.0, 0.0], [1.0, 0.4], [2.0, 0.0]];
+        let post = vec![[1.0, -1.0], [1.0, 0.2]];
+        let mut arcs = vec![
+            Arc {
+                keep: simplify(&bump, shape),
+                points: bump,
+                closed: false,
+                fixed: false,
+            },
+            Arc {
+                keep: vec![true, true],
+                points: post,
+                closed: false,
+                fixed: false,
+            },
+        ];
+        // The simple line of the bump crosses the post.
+        assert_eq!(arcs[0].keep, [true, false, true]);
+        repair(&mut arcs, shape);
+        assert_eq!(arcs[0].keep, [true, true, true]);
     }
 }
